@@ -8,6 +8,14 @@ import open from 'open';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const CONFIG_FILE = path.join(__dirname, '../spotify-config.json');
+const TOKEN_URL = 'https://accounts.spotify.com/api/token';
+const TOKEN_EXPIRY_BUFFER_MS = 60 * 1000;
+
+type TokenResponse = {
+  access_token: string;
+  refresh_token?: string;
+  expires_in: number;
+};
 
 export interface SpotifyConfig {
   clientId: string;
@@ -15,6 +23,7 @@ export interface SpotifyConfig {
   redirectUri: string;
   accessToken?: string;
   refreshToken?: string;
+  expiresAt?: number;
 }
 
 export function loadSpotifyConfig(): SpotifyConfig {
@@ -45,31 +54,164 @@ export function saveSpotifyConfig(config: SpotifyConfig): void {
   fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2), 'utf8');
 }
 
-let cachedSpotifyApi: SpotifyApi | null = null;
+function calculateExpiryTimestamp(expiresInSeconds?: number): number {
+  const safeExpiresIn =
+    typeof expiresInSeconds === 'number' && Number.isFinite(expiresInSeconds)
+      ? expiresInSeconds
+      : 3600;
+  return Date.now() + safeExpiresIn * 1000;
+}
 
-export function createSpotifyApi(): SpotifyApi {
-  if (cachedSpotifyApi) {
-    return cachedSpotifyApi;
+function isTokenExpired(config: SpotifyConfig): boolean {
+  if (!config.expiresAt) {
+    return true;
+  }
+  return config.expiresAt - TOKEN_EXPIRY_BUFFER_MS <= Date.now();
+}
+
+async function requestSpotifyToken(
+  params: URLSearchParams,
+  config: SpotifyConfig,
+): Promise<TokenResponse> {
+  const authHeader = `Basic ${base64Encode(`${config.clientId}:${config.clientSecret}`)}`;
+
+  const response = await fetch(TOKEN_URL, {
+    method: 'POST',
+    headers: {
+      Authorization: authHeader,
+      'Content-Type': 'application/x-www-form-urlencoded',
+    },
+    body: params,
+  });
+
+  if (!response.ok) {
+    const errorData = await response.text();
+    throw new Error(`Spotify token request failed: ${errorData}`);
   }
 
+  const data = await response.json();
+  return {
+    access_token: data.access_token,
+    refresh_token: data.refresh_token,
+    expires_in:
+      typeof data.expires_in === 'number' ? data.expires_in : 3600,
+  };
+}
+
+async function refreshAccessTokenWithSpotify(
+  config: SpotifyConfig,
+): Promise<TokenResponse> {
+  if (!config.refreshToken) {
+    throw new Error('Spotify refresh token is missing.');
+  }
+
+  const params = new URLSearchParams();
+  params.append('grant_type', 'refresh_token');
+  params.append('refresh_token', config.refreshToken);
+
+  return await requestSpotifyToken(params, config);
+}
+
+async function ensureAccessToken(
+  config: SpotifyConfig,
+  options: { forceRefresh?: boolean } = {},
+): Promise<SpotifyConfig> {
+  if (!config.accessToken || !config.refreshToken) {
+    return config;
+  }
+
+  const needsRefresh =
+    options.forceRefresh === true || isTokenExpired(config);
+
+  if (!needsRefresh) {
+    return config;
+  }
+
+  const tokens = await refreshAccessTokenWithSpotify(config);
+  config.accessToken = tokens.access_token;
+  if (tokens.refresh_token) {
+    config.refreshToken = tokens.refresh_token;
+  }
+  config.expiresAt = calculateExpiryTimestamp(tokens.expires_in);
+  saveSpotifyConfig(config);
+
+  return config;
+}
+
+let cachedSpotifyApi: SpotifyApi | null = null;
+let cachedAuthMode: 'user' | 'client' | null = null;
+let cachedAccessToken: string | null = null;
+
+function resetSpotifyApiCache(): void {
+  cachedSpotifyApi = null;
+  cachedAuthMode = null;
+  cachedAccessToken = null;
+}
+
+type CreateSpotifyApiOptions = {
+  forceTokenRefresh?: boolean;
+};
+
+export async function createSpotifyApi(
+  options: CreateSpotifyApiOptions = {},
+): Promise<SpotifyApi> {
   const config = loadSpotifyConfig();
 
   if (config.accessToken && config.refreshToken) {
-    const accessToken = {
-      access_token: config.accessToken,
-      token_type: 'Bearer',
-      expires_in: 3600 * 24 * 30, // Default to 1 month
-      refresh_token: config.refreshToken,
-    };
+    const updatedConfig = await ensureAccessToken(config, {
+      forceRefresh: options.forceTokenRefresh,
+    });
 
-    cachedSpotifyApi = SpotifyApi.withAccessToken(config.clientId, accessToken);
+    const accessToken = updatedConfig.accessToken;
+    const refreshToken = updatedConfig.refreshToken;
+
+    if (!accessToken || !refreshToken) {
+      throw new Error(
+        'Spotify configuration is missing access or refresh token.',
+      );
+    }
+
+    const shouldRecreate =
+      !cachedSpotifyApi ||
+      cachedAuthMode !== 'user' ||
+      cachedAccessToken !== accessToken;
+
+    if (shouldRecreate) {
+      const expiresInSeconds = Math.max(
+        60,
+        Math.floor(
+          ((updatedConfig.expiresAt ?? Date.now()) - Date.now()) / 1000,
+        ),
+      );
+
+      cachedSpotifyApi = SpotifyApi.withAccessToken(updatedConfig.clientId, {
+        access_token: accessToken,
+        token_type: 'Bearer',
+        expires_in: expiresInSeconds,
+        refresh_token: refreshToken,
+      });
+      cachedAuthMode = 'user';
+      cachedAccessToken = accessToken;
+    }
+
+    if (!cachedSpotifyApi) {
+      throw new Error('Failed to initialize Spotify API client with user tokens.');
+    }
     return cachedSpotifyApi;
   }
 
-  cachedSpotifyApi = SpotifyApi.withClientCredentials(
-    config.clientId,
-    config.clientSecret,
-  );
+  if (!cachedSpotifyApi || cachedAuthMode !== 'client') {
+    cachedSpotifyApi = SpotifyApi.withClientCredentials(
+      config.clientId,
+      config.clientSecret,
+    );
+    cachedAuthMode = 'client';
+    cachedAccessToken = null;
+  }
+
+  if (!cachedSpotifyApi) {
+    throw new Error('Failed to initialize Spotify API client.');
+  }
 
   return cachedSpotifyApi;
 }
@@ -93,34 +235,13 @@ function base64Encode(str: string): string {
 async function exchangeCodeForToken(
   code: string,
   config: SpotifyConfig,
-): Promise<{ access_token: string; refresh_token: string }> {
-  const tokenUrl = 'https://accounts.spotify.com/api/token';
-  const authHeader = `Basic ${base64Encode(`${config.clientId}:${config.clientSecret}`)}`;
-
+): Promise<TokenResponse> {
   const params = new URLSearchParams();
   params.append('grant_type', 'authorization_code');
   params.append('code', code);
   params.append('redirect_uri', config.redirectUri);
 
-  const response = await fetch(tokenUrl, {
-    method: 'POST',
-    headers: {
-      Authorization: authHeader,
-      'Content-Type': 'application/x-www-form-urlencoded',
-    },
-    body: params,
-  });
-
-  if (!response.ok) {
-    const errorData = await response.text();
-    throw new Error(`Failed to exchange code for token: ${errorData}`);
-  }
-
-  const data = await response.json();
-  return {
-    access_token: data.access_token,
-    refresh_token: data.refresh_token,
-  };
+  return await requestSpotifyToken(params, config);
 }
 
 export async function authorizeSpotify(): Promise<void> {
@@ -223,9 +344,15 @@ export async function authorizeSpotify(): Promise<void> {
         try {
           const tokens = await exchangeCodeForToken(code, config);
 
+          if (!tokens.refresh_token) {
+            throw new Error('No refresh token returned from Spotify.');
+          }
+
           config.accessToken = tokens.access_token;
           config.refreshToken = tokens.refresh_token;
+          config.expiresAt = calculateExpiryTimestamp(tokens.expires_in);
           saveSpotifyConfig(config);
+          resetSpotifyApiCache();
 
           res.end(
             '<html><body><h1>Authentication Successful!</h1><p>You can now close this window and return to the application.</p></body></html>',
@@ -282,20 +409,88 @@ export function formatDuration(ms: number): string {
 export async function handleSpotifyRequest<T>(
   action: (spotifyApi: SpotifyApi) => Promise<T>,
 ): Promise<T> {
-  try {
-    const spotifyApi = createSpotifyApi();
-    return await action(spotifyApi);
-  } catch (error) {
-    // Skip JSON parsing errors as these are actually successful operations
-    const errorMessage = error instanceof Error ? error.message : String(error);
-    if (
-      errorMessage.includes('Unexpected token') ||
-      errorMessage.includes('Unexpected non-whitespace character') ||
-      errorMessage.includes('Exponent part is missing a number in JSON')
-    ) {
-      return undefined as T;
+  let lastError: unknown;
+
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const spotifyApi = await createSpotifyApi({
+        forceTokenRefresh: attempt > 0 && isAuthError(lastError),
+      });
+      return await action(spotifyApi);
+    } catch (error) {
+      lastError = error;
+      const errorMessage = error instanceof Error ? error.message : String(error);
+
+      if (shouldIgnoreJsonParseError(errorMessage)) {
+        return undefined as T;
+      }
+
+      const recovered = await attemptAuthRecovery(error, attempt);
+      if (recovered) {
+        continue;
+      }
+
+      throw error;
     }
-    // Rethrow other errors
-    throw error;
+  }
+
+  throw lastError instanceof Error
+    ? lastError
+    : new Error(String(lastError));
+}
+
+function shouldIgnoreJsonParseError(message: string): boolean {
+  return (
+    message.includes('Unexpected token') ||
+    message.includes('Unexpected non-whitespace character') ||
+    message.includes('Exponent part is missing a number in JSON')
+  );
+}
+
+function isAuthError(error: unknown): boolean {
+  if (!error) {
+    return false;
+  }
+
+  if (
+    typeof error === 'object' &&
+    'status' in error &&
+    typeof (error as { status?: number }).status === 'number'
+  ) {
+    return (error as { status?: number }).status === 401;
+  }
+
+  if (
+    typeof error === 'object' &&
+    'statusCode' in error &&
+    typeof (error as { statusCode?: number }).statusCode === 'number'
+  ) {
+    return (error as { statusCode?: number }).statusCode === 401;
+  }
+
+  const message = error instanceof Error ? error.message : String(error);
+  const lower = message.toLowerCase();
+  return lower.includes('token expired') || lower.includes('access token');
+}
+
+async function attemptAuthRecovery(
+  error: unknown,
+  attempt: number,
+): Promise<boolean> {
+  if (attempt > 0 || !isAuthError(error)) {
+    return false;
+  }
+
+  try {
+    const config = loadSpotifyConfig();
+    if (!config.refreshToken) {
+      return false;
+    }
+
+    await ensureAccessToken(config, { forceRefresh: true });
+    resetSpotifyApiCache();
+    return true;
+  } catch {
+    return false;
   }
 }
